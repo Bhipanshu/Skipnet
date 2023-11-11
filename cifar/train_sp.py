@@ -7,6 +7,9 @@ from __future__ import print_function
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
+import torchvision.models as models
+
+# from ptflops import get_model_complexity_info
 from torch.autograd import Variable
 
 import os
@@ -17,12 +20,16 @@ import logging
 
 import models
 from data import *
+from sklearn.metrics import precision_score, recall_score, f1_score     # to find out evaluation matric like precision, f1 etc
+
 
 
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith('__')
                      and callable(models.__dict__[name])
                      )
+device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+print(device)
 
 
 def parse_args():
@@ -39,7 +46,7 @@ def parse_args():
     parser.add_argument('--gate-type', type=str, default='ff',
                         choices=['ff', 'rnn'], help='gate type')
     parser.add_argument('--dataset', '-d', default='cifar10', type=str,
-                        choices=['cifar10', 'cifar100'],
+                        choices=['cifar10', 'cifar100','replayattack'],
                         help='dataset type')
     parser.add_argument('--workers', default=1, type=int, metavar='N',
                         help='number of data loading workers (default: 4 )')
@@ -73,10 +80,24 @@ def parse_args():
                         help='evaluate model every (default: 1000) iterations')
     parser.add_argument('--verbose', action="store_true",
                         help='print layer skipping ratio at training')
+    
+    parser.add_argument('--start_epoch', default=0, type=int, metavar='SE',
+                    help='Manual epoch number (useful on restarts)')
+    parser.add_argument('--epochs', default=100, type=int, metavar='N',
+                    help='Number of total epochs to run')
 
     args = parser.parse_args()
     return args
+def compute_metrics(target, output):
+    _, pred = output.topk(1, 1, True, True)
+    pred = pred.squeeze().cpu().numpy()
+    target = target.cpu().numpy()
 
+    precision = precision_score(target, pred, average='macro', zero_division=1)
+    recall = recall_score(target, pred, average='macro', zero_division=1)
+    f1 = f1_score(target, pred, average='macro', zero_division=1)
+
+    return precision, recall, f1
 
 def main():
     args = parse_args()
@@ -104,9 +125,11 @@ def main():
 
 
 def run_training(args):
+    device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+
     # create model
     model = models.__dict__[args.arch](args.pretrained)
-    model = torch.nn.DataParallel(model).cuda()
+    model.to(device)
 
     best_prec1 = 0
 
@@ -136,7 +159,7 @@ def run_training(args):
                                     num_workers=args.workers)
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
     optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad,
                                        model.parameters()),
@@ -149,89 +172,108 @@ def run_training(args):
     losses = AverageMeter()
     top1 = AverageMeter()
     skip_ratios = ListAverageMeter()
+    import time
 
-    end = time.time()
-    for i in range(args.start_iter, args.iters):
-        model.train()
-        adjust_learning_rate(args, optimizer, i)
+    total_train_time = 0
 
-        input, target = next(iter(train_loader))
-        # measuring data loading time
-        data_time.update(time.time() - end)
+# Initialize a variable to keep track of the total training time
 
-        target = target.cuda(async=False)
-        input_var = Variable(input).cuda()
-        target_var = Variable(target).cuda()
-
-        # compute output
-        output, masks, logprobs = model(input_var)
-
-        # collect skip ratio of each layer
-        skips = [mask.data.le(0.5).float().mean() for mask in masks]
-        if skip_ratios.len != len(skips):
-            skip_ratios.set_len(len(skips))
-
-        loss = criterion(output, target_var)
-
-        # measure accuracy and record loss
-        prec1, = accuracy(output.data, target, topk=(1,))
-        losses.update(loss.data[0], input.size(0))
-        top1.update(prec1[0], input.size(0))
-        skip_ratios.update(skips, input.size(0))
-
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # repackage hidden units for RNN Gate
-        if args.gate_type == 'rnn':
-            model.module.control.repackage_hidden()
-
-        batch_time.update(time.time() - end)
+    for epoch in range(args.start_epoch, args.epochs):
         end = time.time()
 
-        # print log
-        if i % args.print_freq == 0 or i == (args.iters - 1):
-            logging.info("Iter: [{0}/{1}]\t"
+        model.train()
+        adjust_learning_rate(args, optimizer, epoch)
+
+        data_time.reset()
+        batch_time.reset()
+        best_prec1 = 0
+
+        for i, (input, target) in enumerate(train_loader):
+            data_time.update(time.time() - end)
+
+            target = target.to(device, non_blocking=False)
+            input_var = Variable(input).to(device)
+            target_var = Variable(target).to(device)
+
+            # compute output
+            output, masks, logprobs = model(input_var)
+
+            # collect skip ratio of each layer
+            skips = [mask.data.le(0.5).float().mean() for mask in masks]
+            if skip_ratios.len != len(skips):
+                skip_ratios.set_len(len(skips))
+
+            loss = criterion(output, target_var)
+
+            prec1 , = accuracy(output.data,target,topk=(1,))
+            losses.update(loss.data, input.size(0))
+            top1.update(prec1, input.size(0))
+            skip_ratios.update(skips, input.size(0))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if args.gate_type == 'rnn':
+                model.module.control.repackage_hidden()
+
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+        # Calculate the total training time for this epoch
+               # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+
+            if i % args.print_freq == 0 or i == (len(train_loader) - 1):
+                logging.info("Epoch: [{0}][{1}/{2}]\t"
                          "Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t"
                          "Data {data_time.val:.3f} ({data_time.avg:.3f})\t"
                          "Loss {loss.val:.3f} ({loss.avg:.3f})\t"
                          "Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t".format(
+                            epoch,
                             i,
-                            args.iters,
+                            len(train_loader),
                             batch_time=batch_time,
                             data_time=data_time,
                             loss=losses,
                             top1=top1)
-            )
-            for idx in range(skip_ratios.len):
-                logging.info(
-                    "{} layer skipping = {:.3f}({:.3f})".format(
-                        idx,
-                        skip_ratios.val[idx],
-                        skip_ratios.avg[idx],
-                    )
                 )
+                # for idx in range(skip_ratios.len):
+                #     logging.info(
+                #         "{} layer skipping = {:.3f}({:.3f})".format(
+                #             idx,
+                #         skip_ratios.val[idx],
+                #             skip_ratios.avg[idx],
+                #         )
+                #     )
 
-        # evaluate every 1000 steps
-        if (i % args.eval_every == 0 and i > 0) or (i == (args.iters-1)):
-            prec1 = validate(args, test_loader, model, criterion)
-            is_best = prec1 > best_prec1
-            best_prec1 = max(prec1, best_prec1)
-            checkpoint_path = os.path.join(args.save_path,
-                                           'checkpoint_{:05d}.pth.tar'.format(
-                                               i))
-            save_checkpoint({
-                'iter': i,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'best_prec1': best_prec1,
-            },
-                is_best, filename=checkpoint_path)
-            shutil.copyfile(checkpoint_path, os.path.join(args.save_path,
-                                                          'checkpoint_latest'
-                                                          '.pth.tar'))
+        
+        epoch_train_time = time.time() - end
+        total_train_time += epoch_train_time
+        prec1 = validate(args,test_loader,model,criterion)
+
+        is_best = prec1 > best_prec1
+    
+        best_prec1 = max(prec1, best_prec1)
+        checkpoint_path = os.path.join(args.save_path, 'model_checkpoint.pth')
+        save_checkpoint({
+            'epoch': epoch,
+            'arch': args.arch,
+            'state_dict': model.state_dict(),
+            'best_prec1': best_prec1,
+        }, is_best, filename=checkpoint_path)
+        shutil.copyfile(checkpoint_path, os.path.join(args.save_path, 'checkpoint_latest.pth'))
+
+    print("Total training time for {} epochs: {:.2f} minutes".format(args.epochs, total_train_time))
+
+
+
+
+        
+
+device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
 
 
 def validate(args, test_loader, model, criterion):
@@ -244,9 +286,11 @@ def validate(args, test_loader, model, criterion):
     model.eval()
     end = time.time()
     for i, (input, target) in enumerate(test_loader):
-        target = target.cuda(async=True)
-        input_var = Variable(input, volatile=True).cuda()
-        target_var = Variable(target, volatile=True).cuda()
+        target = target.to(device, non_blocking=False)
+        input_var = input.to(device)
+        target_var = target.to(device)
+
+
         # compute output
         output, masks, _ = model(input_var)
         skips = [mask.data.le(0.5).float().mean() for mask in masks]
@@ -256,9 +300,9 @@ def validate(args, test_loader, model, criterion):
 
         # measure accuracy and record loss
         prec1, = accuracy(output.data, target, topk=(1,))
-        top1.update(prec1[0], input.size(0))
+        top1.update(prec1, input.size(0))
         skip_ratios.update(skips, input.size(0))
-        losses.update(loss.data[0], input.size(0))
+        losses.update(loss.data, input.size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -288,6 +332,18 @@ def validate(args, test_loader, model, criterion):
     # compute `computational percentage`
     cp = ((sum(skip_summaries) + 1) / (len(skip_summaries) + 1)) * 100
     logging.info('*** Computation Percentage: {:.3f} %'.format(cp))
+    logging.info(' * Prec@1 {top1.avg:.3f}'.format(top1=top1))
+    precision, recall, f1 = compute_metrics(target, output)
+    logging.info(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1 Score: {f1:.4f}")
+    
+#     from thop import profile
+#     input_tensor = torch.randn(1, 3, 32, 32).to(device)
+# # Profile the model to calculate FLOPs
+#     flops, params = profile(model, inputs=(input_tensor,))
+#     total_flops = flops / 10 ** 6  
+#     total_params = params / 10 ** 6
+#     print(f"Total FLOPs: {total_flops:.2f} MFLOPs")
+#     print(f'Total parameters: {total_params:.2f} Params(M)')
 
     return top1.avg
 
@@ -295,17 +351,18 @@ def validate(args, test_loader, model, criterion):
 def test_model(args):
     # create model
     model = models.__dict__[args.arch](args.pretrained)
-    model = torch.nn.DataParallel(model).cuda()
+    model.to(device)
+    # model = torch.nn.DataParallel(model).to(device)
 
     if args.resume:
         if os.path.isfile(args.resume):
             logging.info('=> loading checkpoint `{}`'.format(args.resume))
             checkpoint = torch.load(args.resume)
-            args.start_iter = checkpoint['iter']
+            args.start_epoch = checkpoint['epoch']
             best_prec1 = checkpoint['best_prec1']
             model.load_state_dict(checkpoint['state_dict'])
             logging.info('=> loaded checkpoint `{}` (iter: {})'.format(
-                args.resume, checkpoint['iter']
+                args.resume, checkpoint['epoch']
             ))
         else:
             logging.info('=> no checkpoint found at `{}`'.format(args.resume))
@@ -315,8 +372,7 @@ def test_model(args):
                                     batch_size=args.batch_size,
                                     shuffle=False,
                                     num_workers=args.workers)
-    criterion = nn.CrossEntropyLoss().cuda()
-
+    criterion = nn.CrossEntropyLoss().to(device)
     validate(args, test_loader, model, criterion)
 
 
